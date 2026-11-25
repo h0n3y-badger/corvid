@@ -1,0 +1,16 @@
+[package]
+name = "corvid-core"
+description = "Engine-independent host for corvid: settings, themes, privacy, mod bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+notify.workspace = true
+log.workspace = true
+rand.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
