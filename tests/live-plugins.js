@@ -24,6 +24,20 @@ out.sentryClient = typeof window.DiscordSentry?.getClient?.();
 out.imageDecoder = typeof ImageDecoder, out.offscreen = typeof OffscreenCanvas;
 // Emoji gate: would Discord let us use an emoji from a server we don't share with this channel?
 const ES = c.stores.EmojiStore;
-out.emojiBypassPatched = c._internal.patches.some(p => p.plugin === "FakeNitro" && String(p.src).includes("GUILD_SUBSCRIPTION_UNAVAILABLE") && p.hits);
+const fnEmoji = c._internal.patches.find(p => p.plugin === "FakeNitro" && String(p.src).includes("getEmojiUnavailableReason"));
+out.fakeNitroEmojiPatch = fnEmoji ? { hits: fnEmoji.hits, failed: fnEmoji.failed, applied: fnEmoji.reps.every(r => r.applied > 0) } : "missing";
+const EU = wp.findByProps("getEmojiUnavailableReason", "isEmojiFiltered");
+const Intent = wp.find(m => m.EmojiIntention?.CHAT === 3)?.EmojiIntention;
+const chan = c.stores.ChannelStore.getChannel(c.stores.SelectedChannelStore?.getChannelId?.() ?? "");
+let foreign = null;
+for (const g of Object.keys(c.stores.GuildStore.getGuilds())) {
+    if (g === chan?.guild_id) continue;
+    foreign = (ES.getGuildEmoji(g) ?? []).find(e => e.animated);
+    if (foreign) break;
+}
+out.foreignEmojiGate = EU && Intent && foreign ? {
+    chat: EU.getEmojiUnavailableReason({ emoji: foreign, channel: chan, intention: Intent.CHAT }),
+    reaction: EU.getEmojiUnavailableReason({ emoji: foreign, channel: chan, intention: Intent.REACTION }),
+} : null;
 out.heapMB = Math.round(performance.memory.usedJSHeapSize / 1048576);
 return JSON.stringify(out);

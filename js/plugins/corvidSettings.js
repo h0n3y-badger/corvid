@@ -649,7 +649,7 @@ function renderAbout(panel, title) {
         h("div", { class: "card" }, dl),
         patchInfo,
         h("div", { class: "card" },
-            h("p", { class: "muted" }, "corvid is free software (MIT; the FakeNitro plugin is GPL-3.0-or-later). Open these settings anywhere with ",
+            h("p", { class: "muted" }, "corvid is free software under the MIT license. Open these settings anywhere with ",
                 h("kbd", { text: "Ctrl+Shift+," }), ".")),
         h("div", { class: "row" }, h("div", { class: "grow" }),
             h("button", { class: "btn", text: "Relaunch corvid", onclick: relaunch })));

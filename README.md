@@ -79,19 +79,13 @@ CEF_PATH=~/.local/share/cef scripts/install.sh   # tests, release build, install
 
 ## License
 
-corvid's own code is MIT ([LICENSE](LICENSE)). Two parts come from other
-projects and keep their licenses:
+MIT ([LICENSE](LICENSE)), except `crates/corvid-core/src/themes.rs`, which
+ports BetterDiscord's theme meta parser and stays Apache-2.0
+([LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt)).
 
-- `js/plugins/fakeNitro.js` is a port of Vencord/Equicord's FakeNitro plugin:
-  GPL-3.0-or-later ([LICENSES/GPL-3.0-or-later.txt](LICENSES/GPL-3.0-or-later.txt)).
-  Its GIF encoder is adapted from gifenc (MIT,
-  [LICENSES/gifenc-MIT.txt](LICENSES/gifenc-MIT.txt)).
-- `crates/corvid-core/src/themes.rs` ports BetterDiscord's theme meta parser:
-  Apache-2.0 ([LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt)).
-
-The plugins are embedded in the binary, so a built `corvid` that includes
-FakeNitro is distributed under GPL-3.0-or-later as a whole. Without
-`fakeNitro.js`, everything is MIT/Apache-2.0.
+The FakeNitro plugin is a clean-room implementation: written from a
+behavioural spec by someone who hadn't seen any other client mod's FakeNitro
+code, with every patch derived from Discord's own web build.
 
 corvid is not affiliated with Discord. Client mods break Discord's Terms of
 Service; use at your own risk.
