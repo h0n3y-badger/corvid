@@ -12,6 +12,8 @@ pub struct Paths {
     pub profile_dir: PathBuf,
     /// Cached remote theme assets ($XDG_CACHE_HOME/corvid/theme-assets).
     pub asset_cache: PathBuf,
+    /// Media transcoded to WebM ($XDG_CACHE_HOME/corvid/media).
+    pub media_cache: PathBuf,
 }
 
 impl Paths {
@@ -22,6 +24,7 @@ impl Paths {
             quick_css: data_dir.join("quick.css"),
             profile_dir: data_dir.join("profile"),
             asset_cache: cache_dir.join("theme-assets"),
+            media_cache: cache_dir.join("media"),
             data_dir,
         }
     }
@@ -42,8 +45,18 @@ impl Paths {
     }
 
     pub fn create_dirs(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         for d in [&self.data_dir, &self.themes_dir, &self.profile_dir] {
             std::fs::create_dir_all(d)?;
+        }
+        // Login profile, settings, logs and the transcoded attachments you
+        // viewed: owner only (the umask usually leaves them world-readable).
+        let cache_root = self.media_cache.parent().map(PathBuf::from);
+        for d in std::iter::once(self.data_dir.clone()).chain(cache_root) {
+            let _ = std::fs::create_dir_all(&d);
+            if let Err(e) = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)) {
+                log::warn!("chmod 700 {}: {e}", d.display());
+            }
         }
         // Equicord-era quick CSS, if any, becomes the new quick.css once.
         let old = self.data_dir.join("settings/quickCss.css");

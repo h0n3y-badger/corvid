@@ -18,7 +18,7 @@ use std::{
 };
 
 use cef::*;
-use corvid_core::{Host, Paths, Ui, bundle, privacy};
+use corvid_core::{Host, Paths, Ui, bundle, media, privacy};
 use serde_json::{Value, json};
 
 use crate::{Options, ms};
@@ -28,6 +28,8 @@ const MSG_CONFIG: &str = "corvid-config";
 const NATIVE_POST: &str = "__corvidNative";
 
 static RELAUNCH: AtomicBool = AtomicBool::new(false);
+/// --smoke-js run: file:// test pages count as Discord for host→page calls.
+static SMOKE: AtomicBool = AtomicBool::new(false);
 
 fn cs(s: &str) -> CefString {
     CefString::from(s)
@@ -112,6 +114,8 @@ struct Shared {
     /// The browser's extra_info already carries a fresh config: skip the
     /// duplicate push for the first Discord navigation.
     skip_config_push: AtomicBool,
+    /// H.264/HEVC/AAC → WebM for media elements (None = off).
+    media: Option<media::Transcoder>,
 }
 
 impl Shared {
@@ -128,6 +132,8 @@ impl Shared {
             "css": css,
             "token": self.token,
             "version": versions(),
+            // --smoke-js: tests reach the full API through the page global
+            "test": self.opts.smoke_js.is_some(),
         })
         .to_string()
     }
@@ -172,7 +178,7 @@ wrap_task! {
         fn execute(&self) {
             with_main_frame(|f| {
                 let u = us(&f.url());
-                if is_discord(&u) || u.starts_with("file://") {
+                if is_discord(&u) || (SMOKE.load(Ordering::Relaxed) && u.starts_with("file://")) {
                     f.execute_java_script(Some(&cs(&self.js)), Some(&cs("corvid://host")), 0);
                 }
             });
@@ -368,7 +374,7 @@ wrap_life_span_handler! {
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             _target_disposition: WindowOpenDisposition,
-            _user_gesture: i32,
+            user_gesture: i32,
             _popup_features: Option<&PopupFeatures>,
             _window_info: Option<&mut WindowInfo>,
             _client: Option<&mut Option<Client>>,
@@ -376,11 +382,16 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
-            // window.open / target=_blank: hand web links to the desktop browser.
+            // window.open / target=_blank: hand web links the user clicked to
+            // the desktop browser (scripts don't get to open tabs there).
             if let Some(u) = target_url.map(|u| u.to_string())
                 && is_web(&u)
             {
-                xdg_open(&u);
+                if user_gesture != 0 {
+                    xdg_open(&u);
+                } else {
+                    log::warn!("blocked popup without a click: {u}");
+                }
             }
             1
         }
@@ -406,9 +417,19 @@ wrap_request_handler! {
                 return 0;
             }
             let url = us(&request.url());
-            // Keep the main frame on Discord; user-clicked links elsewhere go to the browser.
-            if user_gesture != 0 && is_web(&url) && !is_discord(&url) {
-                xdg_open(&url);
+            // Keep the main frame on Discord: user-clicked links elsewhere go
+            // to the browser, script navigations elsewhere are dropped (a
+            // URL-bar-less window showing a fake login page is a phishing
+            // vector). The start URL and --smoke-js test pages are allowed.
+            let allowed = is_discord(&url)
+                || url == self.shared.opts.url
+                || (self.shared.opts.smoke_js.is_some() && url.starts_with("file://"));
+            if !allowed {
+                if user_gesture != 0 && is_web(&url) {
+                    xdg_open(&url);
+                } else {
+                    log::warn!("blocked main-frame navigation to {url}");
+                }
                 return 1;
             }
             // New document coming (reload/navigation): refresh the renderer's config.
@@ -428,10 +449,17 @@ wrap_request_handler! {
             _request_initiator: Option<&CefString>,
             _disable_default_handling: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
+            let request = request?;
+            if self.shared.media.is_some() && request.resource_type() == ResourceType::MEDIA {
+                let url = us(&request.url());
+                if let Some(kind) = media::wants(&url) {
+                    return Some(MediaRequest::new(self.shared.clone(), kind));
+                }
+            }
             if !self.shared.host.options.block_telemetry {
                 return None;
             }
-            let url = us(&request?.url());
+            let url = us(&request.url());
             privacy::is_telemetry(&url).then(|| {
                 log::debug!("telemetry answered locally: {url}");
                 TelemetrySink::new()
@@ -442,10 +470,24 @@ wrap_request_handler! {
 
 // Requests to telemetry endpoints get an empty 204 from here instead of the
 // network, so Discord's code sees success and doesn't queue retries.
+//
+// Every custom ResourceRequestHandler must override on_before_resource_load:
+// cef-rs's default returns ReturnValue::default(), which is RV_CANCEL, so the
+// request is aborted (net::ERR_ABORTED) before resource_handler is asked.
 wrap_resource_request_handler! {
     struct TelemetrySink {}
 
     impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            ReturnValue::CONTINUE
+        }
+
         fn resource_handler(
             &self,
             _browser: Option<&mut Browser>,
@@ -505,6 +547,294 @@ wrap_resource_handler! {
     }
 }
 
+// Media the minimal CEF build can't decode (H.264/HEVC/AAC): served as WebM
+// transcoded by corvid_core::media. Range requests are left to CEF, which
+// calls skip() and turns our 200 into a 206 with Content-Range.
+wrap_resource_request_handler! {
+    struct MediaRequest {
+        shared: Arc<Shared>,
+        kind: media::Kind,
+    }
+
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            ReturnValue::CONTINUE
+        }
+
+        fn resource_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+        ) -> Option<ResourceHandler> {
+            Some(MediaHandler::new(self.shared.clone(), self.kind, Arc::new(Mutex::new(Served::default()))))
+        }
+    }
+}
+
+#[derive(Default)]
+struct Served {
+    file: Option<std::fs::File>,
+    /// Whole file size.
+    len: u64,
+    /// The request's Range header and the inclusive span it resolved to.
+    range_header: String,
+    range: Option<(u64, u64)>,
+    /// Bytes still to send (complete files only).
+    remaining: u64,
+    /// Streaming a file that ffmpeg is still writing: no length, no ranges,
+    /// EOF only once the job has finished.
+    live: Option<Arc<media::Job>>,
+    /// CEF cancelled the request: a pending async read must not touch its buffer.
+    cancelled: bool,
+    origin: String,
+    error: Option<String>,
+}
+
+impl Served {
+    fn load(&mut self, src: &media::Source) {
+        use std::io::{Seek, SeekFrom};
+        let opened = src.open().and_then(|(mut f, live)| {
+            let len = f.metadata()?.len();
+            let range = if live.is_some() { None } else { media::parse_range(&self.range_header, len) };
+            if let Some((first, _)) = range {
+                f.seek(SeekFrom::Start(first))?;
+            }
+            Ok((len, range, f, live))
+        });
+        match opened {
+            Ok((len, range, f, live)) => {
+                self.len = len;
+                self.range = range;
+                self.remaining = range.map_or(len, |(a, b)| b - a + 1);
+                self.file = Some(f);
+                self.live = live;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Read into `buf`. Ok(0) = nothing yet (live) or EOF (complete).
+    fn read_into(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Read;
+        let want = if self.live.is_some() { buf.len() } else { buf.len().min(self.remaining as usize) };
+        let Some(f) = self.file.as_mut() else { return Ok(0) };
+        if want == 0 {
+            return Ok(0);
+        }
+        let n = f.read(&mut buf[..want])?;
+        if self.live.is_none() {
+            self.remaining -= n as u64;
+        }
+        Ok(n)
+    }
+}
+
+/// How long a media request waits for a complete (seekable) transcode before
+/// it starts streaming the live output instead.
+const MEDIA_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// CEF callbacks may be continued from any thread.
+struct SendCallback(Callback);
+// SAFETY: cef_callback_t is thread-safe (ref-counted, Continue on any thread).
+unsafe impl Send for SendCallback {}
+struct SendReadCallback(ResourceReadCallback);
+// SAFETY: as above.
+unsafe impl Send for SendReadCallback {}
+/// CEF's read buffer, valid until the read callback runs (or the request is
+/// cancelled, which `Served::cancelled` guards).
+struct SendBuf(*mut u8, usize);
+// SAFETY: only dereferenced under the Served lock while not cancelled.
+unsafe impl Send for SendBuf {}
+
+wrap_resource_handler! {
+    struct MediaHandler {
+        shared: Arc<Shared>,
+        kind: media::Kind,
+        state: Arc<Mutex<Served>>,
+    }
+
+    impl ResourceHandler {
+        fn open(
+            &self,
+            request: Option<&mut Request>,
+            handle_request: Option<&mut i32>,
+            callback: Option<&mut Callback>,
+        ) -> i32 {
+            let (Some(req), Some(handle), Some(cb), Some(t)) = (request, handle_request, callback, self.shared.media.as_ref())
+            else {
+                return 0;
+            };
+            let url = us(&req.url());
+            {
+                let mut st = self.state.lock().unwrap();
+                st.origin = us(&req.header_by_name(Some(&cs("Origin"))));
+                st.range_header = us(&req.header_by_name(Some(&cs("Range"))));
+            }
+            if let Some(p) = t.cached(&url) {
+                self.state.lock().unwrap().load(&media::Source::File(p));
+                *handle = 1;
+                return 1;
+            }
+            // Transcode off the IO thread; CEF waits for cont().
+            *handle = 0;
+            let cb = SendCallback(cb.clone());
+            let (shared, state) = (self.shared.clone(), self.state.clone());
+            let spawned = std::thread::Builder::new().name("corvid-media".into()).spawn(move || {
+                let cb = cb;
+                let r = shared.media.as_ref().map(|t| t.get(&url, MEDIA_WAIT)).unwrap_or(Err("off".into()));
+                {
+                    let mut st = state.lock().unwrap();
+                    match r {
+                        Ok(p) => st.load(&p),
+                        Err(e) => st.error = Some(e),
+                    }
+                }
+                cb.0.cont();
+            });
+            if spawned.is_err() {
+                return 0;
+            }
+            1
+        }
+
+        fn response_headers(
+            &self,
+            response: Option<&mut Response>,
+            response_length: Option<&mut i64>,
+            _redirect_url: Option<&mut CefString>,
+        ) {
+            let st = self.state.lock().unwrap();
+            let (Some(r), Some(l)) = (response, response_length) else { return };
+            if st.file.is_none() {
+                r.set_status(502);
+                r.set_status_text(Some(&cs("Bad Gateway")));
+                r.set_mime_type(Some(&cs("text/plain")));
+                *l = 0;
+                return;
+            }
+            let origin = if st.origin.is_empty() { "*" } else { &st.origin };
+            r.set_header_by_name(Some(&cs("Access-Control-Allow-Origin")), Some(&cs(origin)), 1);
+            r.set_mime_type(Some(&cs(self.kind.mime())));
+            if st.live.is_some() {
+                // Growing file: unknown length, not seekable on this first play.
+                r.set_status(200);
+                r.set_status_text(Some(&cs("OK")));
+                r.set_header_by_name(Some(&cs("Accept-Ranges")), Some(&cs("none")), 1);
+                *l = -1;
+                return;
+            }
+            // Chromium's media loader needs a real 206 for ranges (CEF passes
+            // our status through unchanged), so the span is served from here.
+            if let Some((a, b)) = st.range {
+                r.set_status(206);
+                r.set_status_text(Some(&cs("Partial Content")));
+                r.set_header_by_name(Some(&cs("Content-Range")), Some(&cs(&format!("bytes {a}-{b}/{}", st.len))), 1);
+            } else {
+                r.set_status(200);
+                r.set_status_text(Some(&cs("OK")));
+            }
+            r.set_header_by_name(Some(&cs("Accept-Ranges")), Some(&cs("bytes")), 1);
+            *l = st.remaining as i64;
+        }
+
+        // The file is already positioned at the range start (Served::load).
+        fn skip(
+            &self,
+            bytes_to_skip: i64,
+            bytes_skipped: Option<&mut i64>,
+            _callback: Option<&mut ResourceSkipCallback>,
+        ) -> i32 {
+            let Some(out) = bytes_skipped else { return 0 };
+            *out = bytes_to_skip;
+            1
+        }
+
+        fn read(
+            &self,
+            data_out: *mut u8,
+            bytes_to_read: i32,
+            bytes_read: Option<&mut i32>,
+            callback: Option<&mut ResourceReadCallback>,
+        ) -> i32 {
+            let Some(out) = bytes_read else { return 0 };
+            if data_out.is_null() || bytes_to_read <= 0 {
+                *out = 0;
+                return 0;
+            }
+            let len = bytes_to_read as usize;
+            let mut st = self.state.lock().unwrap();
+            // SAFETY: CEF hands us a buffer of bytes_to_read bytes.
+            let buf = unsafe { std::slice::from_raw_parts_mut(data_out, len) };
+            match st.read_into(buf) {
+                Ok(n) if n > 0 => {
+                    *out = n as i32;
+                    return 1;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    *out = -2;
+                    return 0;
+                }
+            }
+            // Nothing read. Complete file: EOF.
+            let Some(job) = st.live.clone() else {
+                *out = 0;
+                return 0;
+            };
+            // Live and the job is done: whatever is left was read above, or
+            // arrived just now.
+            if job.finished() {
+                let n = st.read_into(buf).unwrap_or(0);
+                *out = n as i32;
+                return (n > 0) as i32;
+            }
+            // Live, waiting for ffmpeg: finish this read asynchronously.
+            let Some(cb) = callback else {
+                *out = -2;
+                return 0;
+            };
+            drop(st);
+            let (state, cb, dst) = (self.state.clone(), SendReadCallback(cb.clone()), SendBuf(data_out, len));
+            let spawned = std::thread::Builder::new().name("corvid-media-read".into()).spawn(move || {
+                let (cb, dst) = (cb, dst);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    let mut st = state.lock().unwrap();
+                    if st.cancelled {
+                        return;
+                    }
+                    let done = job.finished();
+                    // SAFETY: buffer stays valid until cb runs; not cancelled (checked under the lock).
+                    let buf = unsafe { std::slice::from_raw_parts_mut(dst.0, dst.1) };
+                    let n = st.read_into(buf).unwrap_or(0);
+                    if n > 0 || done {
+                        drop(st);
+                        cb.0.cont(n as i32);
+                        return;
+                    }
+                }
+            });
+            if spawned.is_err() {
+                *out = -2;
+                return 0;
+            }
+            *out = 0;
+            1
+        }
+
+        fn cancel(&self) {
+            self.state.lock().unwrap().cancelled = true;
+        }
+    }
+}
+
 wrap_permission_handler! {
     struct CorvidPermissions {
         // --smoke-js: also grant file:// test pages
@@ -542,7 +872,13 @@ wrap_permission_handler! {
         ) -> i32 {
             let origin = requesting_origin.map(|o| o.to_string()).unwrap_or_default();
             let Some(cb) = callback else { return 0 };
-            let ok = is_discord(&origin) || (self.test && origin.starts_with("file://"));
+            // Only what Discord needs. Accepting the whole mask gave the page
+            // clipboard reads, local-network/loopback fetches, downloads,
+            // protocol handlers, geolocation… without a prompt.
+            // cef_types.h: CAMERA_STREAM 1<<2, MIC_STREAM 1<<12, NOTIFICATIONS 1<<15
+            const PROMPT_OK: u32 = 1 << 2 | 1 << 12 | 1 << 15;
+            let ok = (is_discord(&origin) || (self.test && origin.starts_with("file://")))
+                && requested_permissions & !PROMPT_OK == 0;
             log::info!(
                 "{} permission prompt {requested_permissions:#x} for {origin}",
                 if ok { "accepting" } else { "denying" }
@@ -757,6 +1093,41 @@ fn grant_capture(origins: &[String]) {
     }
 }
 
+/// Chrome prefs for a client that only ever talks to Discord: no search
+/// engine (nothing to preconnect to or run AI-mode checks for), no link
+/// prefetch/preconnect, component updates off. Background traffic these
+/// don't stop is handled by switches (see configure_switches).
+fn quiet_prefs() {
+    fn set(pm: &impl ImplPreferenceManager, name: &str, mut v: cef::Value) {
+        // Must be a real string: for a null error out-param (what
+        // CefString::default() becomes) CEF returns 0 without trying.
+        let mut err = cs("");
+        if pm.set_preference(Some(&cs(name)), Some(&mut v), Some(&mut err)) != 1 {
+            log::warn!("pref {name}: {err}");
+        }
+    }
+    let b = |x: bool| {
+        let v = value_create().expect("value");
+        v.set_bool(x as i32);
+        v
+    };
+    let i = |x: i32| {
+        let v = value_create().expect("value");
+        v.set_int(x);
+        v
+    };
+    if let Some(g) = preference_manager_get_global() {
+        set(&g, "component_updates.component_updates_enabled", b(false));
+    }
+    if let Some(ctx) = request_context_get_global_context() {
+        // No search engine: nothing to preconnect to or check AI mode for.
+        set(&ctx, "default_search_provider.enabled", b(false));
+        set(&ctx, "search.suggest_enabled", b(false));
+        // No DNS prefetch / preconnect for links in messages.
+        set(&ctx, "net.network_prediction_options", i(2));
+    }
+}
+
 wrap_browser_process_handler! {
     struct CorvidBrowserProcess {
         shared: Arc<Shared>,
@@ -772,6 +1143,7 @@ wrap_browser_process_handler! {
             let shared = self.shared.clone();
             let origins: Vec<String> = DISCORD_HOSTS.iter().map(|h| format!("https://{h}/")).collect();
             grant_capture(&origins);
+            quiet_prefs();
             let mut client = CorvidClient::new(shared.clone());
 
             // The renderer can't read files: hand it everything up front.
@@ -913,6 +1285,16 @@ wrap_render_process_handler! {
 
 // ---------------------------------------------------------------- app
 
+/// Hosts only Chrome's own updaters use (component/extension updates,
+/// their downloads, variations seed).
+const GOOGLE_UPDATE_HOSTS: &[&str] = &[
+    "update.googleapis.com",
+    "clients2.google.com",
+    "clients2.googleusercontent.com",
+    "clientservices.googleapis.com",
+    "*.gvt1.com",
+];
+
 /// Chromium switches. Everything here is about startup time, memory and not
 /// phoning home; voice/video/screen share must keep working.
 fn configure_switches(cl: &mut CommandLine, o: &corvid_core::settings::HostOptions) {
@@ -942,6 +1324,16 @@ fn configure_switches(cl: &mut CommandLine, o: &corvid_core::settings::HostOptio
         // Chrome-style browsers preconnect to the default search engine (Google)
         "SearchEnginePreconnect2",
         "PreconnectToSearch",
+        // Omnibox "AI mode" eligibility check: GET www.google.com/async/folae
+        // on every launch (seen in a net log; prefs don't stop it)
+        "AimEnabled",
+        "AimServerEligibilityEnabled",
+        "AimServerRequestOnStartupEnabled",
+        // Reporting API / Network Error Logging: sites register endpoints
+        // (Cloudflare NEL, Google CSP collectors, CloudFront — all seen in
+        // the net log) that get error/CSP reports from this client.
+        "Reporting",
+        "NetworkErrorLogging",
         // resources
         "SpareRendererForSitePerProcess", // no idle spare renderer (~30-50 MB)
         "BackForwardCache",
@@ -999,8 +1391,15 @@ fn configure_switches(cl: &mut CommandLine, o: &corvid_core::settings::HostOptio
     }
     // Discord plays notification/ringing sounds without a click first.
     swv("autoplay-policy", "no-user-gesture-required");
-    if o.hide_local_ips && !has("force-webrtc-ip-handling-policy") {
-        swv("force-webrtc-ip-handling-policy", "default_public_interface_only");
+    if !has("force-webrtc-ip-handling-policy") {
+        if !o.proxy.is_empty() || has("proxy-server") {
+            // With a proxy, WebRTC must not send UDP around it: voice servers
+            // and DM-call peers would see the real address. Voice then only
+            // works if it can go through the proxy.
+            swv("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
+        } else if o.hide_local_ips {
+            swv("force-webrtc-ip-handling-policy", "default_public_interface_only");
+        }
     }
     if !o.spellcheck {
         sw("disable-spell-checking");
@@ -1013,6 +1412,13 @@ fn configure_switches(cl: &mut CommandLine, o: &corvid_core::settings::HostOptio
         swv("proxy-server", &o.proxy);
         // DNS through the proxy too (socks5 resolves remotely).
         swv("host-resolver-rules", "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1");
+    } else if !has("host-resolver-rules") {
+        // Chrome's updater hosts never resolve. With updates disabled the
+        // component updater still pings update.googleapis.com every launch
+        // ("noupdate: disabled by client" — it only reports that it exists),
+        // so this costs nothing; Discord never uses these hosts.
+        let rules: Vec<String> = GOOGLE_UPDATE_HOSTS.iter().map(|h| format!("MAP {h} ~NOTFOUND")).collect();
+        swv("host-resolver-rules", &rules.join(" , "));
     }
 }
 
@@ -1063,6 +1469,7 @@ pub fn run(opts: Options, paths: Paths, listener: Option<UnixListener>) -> Resul
         // Renderer processes inherit this: inject into file:// test pages too.
         // SAFETY: no other threads exist yet.
         unsafe { std::env::set_var("CORVID_TEST_ANY_PAGE", "1") };
+        SMOKE.store(true, Ordering::Relaxed);
     }
     let host = Host::new(paths.clone()).map_err(|e| format!("data dir {}: {e}", paths.data_dir.display()))?;
     let sources = bundle::Sources::load();
@@ -1079,6 +1486,11 @@ pub fn run(opts: Options, paths: Paths, listener: Option<UnixListener>) -> Resul
         work_tx: Mutex::new(work_tx),
         watching: AtomicBool::new(false),
         skip_config_push: AtomicBool::new(false),
+        media: host
+            .options
+            .transcode_media
+            .then(|| media::Transcoder::new(paths.media_cache.clone(), &effective_proxy(&host.options.proxy)))
+            .filter(|t| t.enabled()),
     });
     host.set_ui(Arc::new(CefUi { shared: Arc::downgrade(&shared) }));
     let watcher = host.watch().map_err(|e| log::warn!("theme watcher: {e}")).ok();
@@ -1132,6 +1544,21 @@ pub fn run(opts: Options, paths: Paths, listener: Option<UnixListener>) -> Resul
     run_message_loop();
     shutdown();
     Ok(RELAUNCH.load(Ordering::SeqCst))
+}
+
+/// The proxy Chromium will use: a --proxy-server on the command line wins
+/// over settings (configure_switches), and ffmpeg must follow the same one.
+fn effective_proxy(configured: &str) -> String {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if let Some(v) = a.strip_prefix("--proxy-server=") {
+            return v.to_owned();
+        }
+        if a == "--proxy-server" {
+            return args.next().unwrap_or_default();
+        }
+    }
+    configured.to_owned()
 }
 
 fn rand_u128() -> u128 {

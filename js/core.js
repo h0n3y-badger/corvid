@@ -153,6 +153,22 @@
     const patches = [];  // { plugin, find:[...], replacement:[...], all, hits, ... }
     const GLOBAL = cfg.token ? "__cv" + cfg.token.slice(0, 12) : "__corvid";
     const corvid = {};
+    // What patched Discord code reaches as `$self`: per plugin, only the
+    // members its patch replacements name. The page global must not hand
+    // Discord's scripts (or anything injected into the page) the host bridge,
+    // settings or plugin setting stores — those can rewrite host options
+    // (proxy, telemetry blocking) and persist across restarts.
+    const pagePlugins = Object.create(null);
+    function exposeToPatches(p, replace) {
+        if (typeof replace !== "string") return;
+        const face = (pagePlugins[p.name] ??= Object.create(null));
+        for (const [, k] of replace.matchAll(/\$self\.([A-Za-z_$][\w$]*)/g)) {
+            if (k in face) continue;
+            Object.defineProperty(face, k, typeof p[k] === "function"
+                ? { value: function (...a) { return p[k].apply(p, a); } }
+                : { get: () => p[k] });
+        }
+    }
 
     function pluginSettings(name) {
         return (settings.plugins[name] ??= {});
@@ -206,7 +222,7 @@
         for (const raw of p.patches ?? []) {
             if (raw.predicate && !safe(() => raw.predicate(), p.name)) continue;
             const finds = (Array.isArray(raw.find) ? raw.find : [raw.find]).map(canonMatch);
-            const reps = (Array.isArray(raw.replacement) ? raw.replacement : [raw.replacement]).map(r => ({
+            const reps = (Array.isArray(raw.replacement) ? raw.replacement : [raw.replacement]).map(r => (exposeToPatches(p, r.replace), {
                 match: canonMatch(r.match),
                 replace: canonReplace(r.replace, selfPath),
                 predicate: r.predicate,
@@ -285,6 +301,21 @@
     // Lazy chunks (after ready) are always scanned.
     let bootSkip = null;
     const bootIds = [];
+    // `seen` as sorted base-36 deltas ("d:" prefix): ~2.6x smaller than the
+    // plain id list (78 KB -> 30 KB for 11k ids), which rides in settings.json,
+    // every settings.save and every injected CORVID_CFG.
+    const encIds = ids => {
+        const n = [...new Set(ids)].map(Number);
+        if (!n.every(Number.isSafeInteger)) return ids.join(",");
+        n.sort((a, b) => a - b);
+        let prev = 0;
+        return "d:" + n.map(x => (x - prev).toString(36) + ((prev = x), "")).join(",");
+    };
+    const decIds = s => {
+        if (!s.startsWith("d:")) return s.split(",");
+        let x = 0;
+        return s.slice(2).split(",").map(d => String(x += parseInt(d, 36)));
+    };
     function writeBootCache() {
         if (!cacheBuild) return;
         const c = settings.patchCache;
@@ -292,7 +323,7 @@
         const allHits = {};
         for (const p of patches) if (p.all) allHits[p.key] = p.allIds ?? [];
         if (c.seen && miss.every(k => c.miss?.includes(k)) && Object.keys(allHits).every(k => c.allHits?.[k])) return;
-        c.seen = bootIds.join(",");
+        c.seen = encIds(bootIds);
         c.miss = miss;
         c.allHits = allHits;
         saveSettings();
@@ -332,8 +363,27 @@
         const c = cacheBuild && settings.patchCache;
         bootSkip = null;
         if (c?.seen && !alwaysCheck && patches.every(p => p.all ? p.allCached : (p.hitId !== undefined || c.miss?.includes(p.key))))
-            bootSkip = new Set(c.seen.split(","));
+            bootSkip = new Set(decIds(c.seen));
     }
+
+    // Run one patch's replacements over `code`. Returns { code, done }.
+    function runReps(p, code, id) {
+        const done = [];
+        for (const r of p.reps) {
+            if (r.predicate && !safe(() => r.predicate(), p.plugin)) continue;
+            let next;
+            try { next = code.replace(r.match, r.replace); } catch (e) { err(p.plugin, "replace threw", e); continue; }
+            if (next === code) {
+                if (!r.noWarn && !p.noWarn) warn(`${p.plugin}: replacement ${r.match} had no effect (module ${id})`);
+                continue;
+            }
+            r.applied++;
+            done.push(r);
+            code = next;
+        }
+        return { code, done };
+    }
+    const compileModule = (code, id) => (0, eval)(`0,${toFnSource(code)}\n//# sourceURL=corvid:///WebpackModule${id}`);
 
     function patchFactory(id, factory) {
         if (prefilterDirty) rebuildPrefilter();
@@ -341,9 +391,10 @@
             bootIds.push(id);
             if (bootSkip?.has(id) && !pinned.has(id)) return factory;
         }
-        let code = String(factory);
-        if (!alwaysCheck && !pinned.has(id) && !(prefilter && prefilter.test(code))) return factory;
-        let fn = factory;
+        const original = String(factory);
+        if (!alwaysCheck && !pinned.has(id) && !(prefilter && prefilter.test(original))) return factory;
+        let code = original;
+        const steps = [];  // patches that changed this module, in order
         for (const p of patches) {
             // One module per non-`all` patch, but every copy of it: Discord
             // ships the same module id in several chunks (differently minified)
@@ -354,31 +405,37 @@
             if (p.all && !ready) (p.allIds ??= []).push(id);
             if (!p.cached) cacheHit(p, id);
             p.hits++;
-            const before = code;
-            const done = [];
-            for (const r of p.reps) {
-                if (r.predicate && !safe(() => r.predicate(), p.plugin)) continue;
-                let next;
-                try { next = code.replace(r.match, r.replace); } catch (e) { err(p.plugin, "replace threw", e); continue; }
-                if (next === code) {
-                    if (!r.noWarn && !p.noWarn) warn(`${p.plugin}: replacement ${r.match} had no effect (module ${id})`);
-                    continue;
-                }
-                r.applied++;
-                done.push(r);
-                code = next;
-            }
-            if (!done.length) continue;
+            const r = runReps(p, code, id);
+            if (!r.done.length) continue;
+            steps.push({ p, done: r.done });
+            code = r.code;
+        }
+        if (!steps.length) return factory;
+        // Compile once, not once per patch: a module several patches hit
+        // (FakeNitro's MessageAccessories, ~180 KB) was parsed for each.
+        try {
+            const fn = compileModule(code, id);
+            stats.patched++;
+            return fn;
+        } catch {}
+        // Some patch broke it: redo one patch at a time, dropping the ones
+        // that don't compile (the rest re-run on the reverted source).
+        let fn = factory;
+        code = original;
+        for (const s of steps) {
+            for (const r of s.done) r.applied--;
+            const r = runReps(s.p, code, id);
+            if (!r.done.length) continue;
             try {
-                fn = (0, eval)(`0,${toFnSource(code)}\n//# sourceURL=corvid:///WebpackModule${id}`);
-                stats.patched++;
+                fn = compileModule(r.code, id);
+                code = r.code;
             } catch (e) {
-                err(`${p.plugin}: patch broke module ${id}, reverted`, e);
-                p.failed++;
-                code = before;
-                for (const r of done) r.applied--;
+                err(`${s.p.plugin}: patch broke module ${id}, reverted`, e);
+                s.p.failed++;
+                for (const x of r.done) x.applied--;
             }
         }
+        if (fn !== factory) stats.patched++;
         return fn;
     }
 
@@ -664,7 +721,8 @@
     });
     // A real getter (Object.assign would have copied the value once).
     Object.defineProperty(corvid, "flux", { get: () => flux, enumerable: true });
-    Object.defineProperty(G, GLOBAL, { value: corvid });
+    // Smoke tests (--smoke-js only) use the full API from page context.
+    Object.defineProperty(G, GLOBAL, { value: cfg.test ? corvid : Object.freeze({ plugins: pagePlugins }) });
     // Plugin files reach the API through this lexical name.
     G.__corvidDefine = corvid;
 })();

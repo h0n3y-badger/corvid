@@ -42,7 +42,14 @@ pub struct Host {
     sheets: Mutex<HashMap<String, String>>,
     ui: Mutex<Option<Arc<dyn Ui>>>,
     fetching: Mutex<std::collections::HashSet<String>>,
+    /// Last page-requested open.external (rate limit).
+    last_open: Mutex<Option<std::time::Instant>>,
 }
+
+/// Page-sent quick CSS / settings bigger than this are refused (settings.json
+/// is read at every start and copied into every document).
+const MAX_QUICKCSS: usize = 1 << 20;
+const MAX_SETTINGS: usize = 2 << 20;
 
 pub type CmdResult = Result<Value, String>;
 
@@ -56,7 +63,7 @@ impl Host {
         paths.create_dirs()?;
         let s = settings::load(&paths.settings_file);
         let options = settings::host_options(&s);
-        let cache = AssetCache::new(paths.asset_cache.clone(), options.remote_theme_assets);
+        let cache = AssetCache::new(paths.asset_cache.clone(), options.remote_theme_assets, &options.proxy);
         Ok(Arc::new(Self {
             paths,
             options,
@@ -65,6 +72,7 @@ impl Host {
             sheets: Mutex::new(HashMap::new()),
             ui: Mutex::new(None),
             fetching: Mutex::new(Default::default()),
+            last_open: Mutex::new(None),
         }))
     }
 
@@ -201,6 +209,9 @@ impl Host {
         let str_arg = |k: &str| args.get(k).and_then(Value::as_str).ok_or_else(|| format!("{cmd}: missing {k}"));
         match cmd {
             "settings.save" => {
+                if args.to_string().len() > MAX_SETTINGS {
+                    return Err("settings too large".into());
+                }
                 let mut cur = self.settings.lock().unwrap();
                 let merged = settings::merge_from_page(&cur, args.clone()).ok_or("settings must be an object")?;
                 self.save_settings(&merged)?;
@@ -234,6 +245,9 @@ impl Host {
             "quickcss.get" => Ok(Value::String(fs::read_to_string(&self.paths.quick_css).unwrap_or_default())),
             "quickcss.set" => {
                 let css = str_arg("css")?;
+                if css.len() > MAX_QUICKCSS {
+                    return Err("quick CSS too large".into());
+                }
                 write_atomic(&self.paths.quick_css, css.as_bytes()).map_err(|e| e.to_string())?;
                 // The watcher would catch it too; push now for snappy live preview.
                 self.refresh_sheet(QUICKCSS_ID);
@@ -249,13 +263,22 @@ impl Host {
                 Ok(Value::Null)
             }
             "open.external" => {
-                let url = str_arg("url")?;
-                let ok = url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "https" | "http"));
-                if !ok {
-                    return Err("only http(s) links can be opened".into());
+                let url = url::Url::parse(str_arg("url")?)
+                    .ok()
+                    .filter(|u| matches!(u.scheme(), "https" | "http"))
+                    .ok_or("only http(s) links can be opened")?;
+                // No click is involved here: don't let the page flood the
+                // desktop browser with tabs.
+                {
+                    let mut last = self.last_open.lock().unwrap();
+                    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+                        return Err("open.external: too many requests".into());
+                    }
+                    *last = Some(std::time::Instant::now());
                 }
                 if let Some(ui) = self.ui() {
-                    ui.open_external(url);
+                    // The parsed form: what was checked is what xdg-open gets.
+                    ui.open_external(url.as_str());
                 }
                 Ok(Value::Null)
             }
@@ -267,7 +290,14 @@ impl Host {
             }
             "app.info" => {
                 let mut v = self.ui().map(|u| u.versions()).unwrap_or_else(|| json!({}));
-                v["dataDir"] = Value::String(self.paths.data_dir.to_string_lossy().into_owned());
+                // ~ instead of /home/<user>: the page doesn't need the name.
+                let dir = self.paths.data_dir.to_string_lossy().into_owned();
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dir = match dir.strip_prefix(&home) {
+                    Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+                    _ => dir,
+                };
+                v["dataDir"] = Value::String(dir);
                 Ok(v)
             }
             _ => Err(format!("unknown command {cmd}")),

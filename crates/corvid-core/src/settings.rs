@@ -28,6 +28,9 @@ pub struct HostOptions {
     pub compact_heap: bool,
     /// Fewer processes and smaller caches at some cost in isolation/speed.
     pub low_memory: bool,
+    /// Play H.264/HEVC/AAC videos and GIFs (the bundled Chromium has no such
+    /// decoders) by converting them to WebM with ffmpeg. See media.rs.
+    pub transcode_media: bool,
     /// Window background before Discord paints (ARGB), avoids a white flash.
     pub background: u32,
 }
@@ -43,6 +46,7 @@ impl Default for HostOptions {
             proxy: String::new(),
             compact_heap: true,
             low_memory: false,
+            transcode_media: true,
             background: 0xFF31_3338,
         }
     }

@@ -16,6 +16,8 @@ const HOST_OPTS = [
         "Let corvid fetch fonts and images that themes pull in with @import or url() and inline them. Off: themes can only use what's in their files, and no theme host learns your IP."],
     ["gpu", true, "Hardware acceleration",
         "Render with the GPU. Turn off if you see glitches; uses more CPU."],
+    ["transcodeMedia", true, "Play videos and GIFs",
+        "corvid's Chromium can't decode H.264/AAC (most Discord videos, all picker GIFs), so ffmpeg converts them to WebM as they load (cached in ~/.cache/corvid/media). Needs ffmpeg. Off: those show only a still image."],
     ["compactHeap", true, "Compact JavaScript memory",
         "Tell V8 to optimize for size: about 115 MB (13%) less memory, about 0.2 s slower startup."],
     ["lowMemory", false, "Low memory mode",

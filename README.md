@@ -22,6 +22,16 @@ unimplemented). Everything else is kept as small as possible.
   `host.lowMemory` trims further. The mod layer remembers which Discord
   modules its patches hit per build, so patching costs ~15 ms after the
   first launch of a new Discord build (~40 ms then).
+- **Videos and GIFs play** — the bundled CEF ("minimal" build) has no
+  H.264/HEVC/AAC decoders, which is nearly every Discord video and every GIF
+  from Tenor/Giphy/Klipy (served as MP4). corvid has ffmpeg convert those to
+  WebM (AV1 via NVENC when available, else SVT-AV1/VP9; Opus audio) as the
+  page requests them: clips and GIFs are ready in well under a second and
+  seekable; long videos start streaming after 1.5 s and are seekable on
+  replay. Results are cached in `~/.cache/corvid/media` (LRU, 1 GB). Only
+  Discord's CDN/media proxy and Tenor/Giphy URLs are fetched; with a SOCKS
+  `host.proxy` this is off (ffmpeg can't use it). `host.transcodeMedia: false`
+  turns it off.
 - **Fake nitro** (FakeNitro plugin, on by default) — emojis from any server
   (static + animated) in any channel, guild stickers in other servers (static,
   GIF; APNG converted to GIF), stream quality unlock, client themes, app icons,
@@ -55,7 +65,8 @@ unimplemented). Everything else is kept as small as possible.
 
 ## Build / install
 
-Needs Rust (2024 edition), node (for the patch check) and a CEF 156.0.26
+Needs Rust (2024 edition), node (for the patch check), ffmpeg at runtime (video/GIF
+playback) and a CEF 156.0.26
 linux64 distribution at `CEF_PATH` (cef-rs's `export-cef-dir` tool makes
 one).
 
@@ -74,6 +85,8 @@ CEF_PATH=~/.local/share/cef scripts/install.sh   # tests, release build, install
 - Live, read-only checks in the real client (send nothing):
   `corvid --smoke-js=tests/live-plugins.js`, `tests/live-fakenitro.js`,
   `tests/live-settings-entry.js`; `tests/themes.sh`; `tests/bench.sh`.
+- `tests/media.sh` — H.264/AAC samples from a local server: short clip
+  (complete file + seek), long video (streamed), cached replay (seek).
 - WebRTC probes on a Discord origin:
   `corvid --url=https://discord.com/robots.txt --smoke-js=tests/webrtc-loopback.js`.
 

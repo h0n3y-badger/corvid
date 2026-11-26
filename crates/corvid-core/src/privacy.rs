@@ -23,7 +23,14 @@ const BLOCKED_API: &[&str] = &[
     "/promotions/ack",         // ad impressions
 ];
 
-const DISCORD_HOSTS: &[&str] = &["discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"];
+const DISCORD_HOSTS: &[&str] = &[
+    "discord.com",
+    "ptb.discord.com",
+    "canary.discord.com",
+    "discordapp.com",
+    "ptb.discordapp.com",
+    "canary.discordapp.com",
+];
 
 fn host_matches(host: &str, base: &str) -> bool {
     host == base || (host.len() > base.len() && host.ends_with(base) && host.as_bytes()[host.len() - base.len() - 1] == b'.')
@@ -36,6 +43,8 @@ pub fn is_telemetry(url: &str) -> bool {
         return false;
     }
     let Some(host) = u.host_str() else { return false };
+    // "discord.com." is the same host to DNS and the browser, but not to `==`.
+    let host = host.strip_suffix('.').unwrap_or(host);
     if BLOCKED_HOSTS.iter().any(|b| host_matches(host, b)) {
         return true;
     }
@@ -73,6 +82,14 @@ mod tests {
             "https://discord.com/error-reporting-proxy/web",
             "https://meticulous-ingest.discord.tools/x",
             "https://ptb.discord.com/api/v9/track",
+            // trailing-dot FQDNs and the legacy discordapp.com channels
+            "https://discord.com./api/v9/science",
+            "https://DISCORD.COM./api/v9/science",
+            "https://o1.ingest.sentry.io./api/1/envelope/",
+            "https://canary.discord.com./error-reporting-proxy/web",
+            "https://ptb.discordapp.com/api/v9/science",
+            "https://canary.discordapp.com/api/v9/metrics",
+            "https://discordapp.com./api/track",
         ] {
             assert!(is_telemetry(u), "{u}");
         }
@@ -89,6 +106,8 @@ mod tests {
             "https://evil.com/api/v9/science", // not Discord; irrelevant but not ours to block
             "wss://gateway.discord.gg/?v=9",
             "https://hcaptcha.com/1/api.js",
+            "https://discord.com./api/v9/channels/1/messages",
+            "https://evil.com./api/v9/science",
         ] {
             assert!(!is_telemetry(u), "{u}");
         }

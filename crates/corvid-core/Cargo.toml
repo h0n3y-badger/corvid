@@ -13,4 +13,4 @@ url.workspace = true
 notify.workspace = true
 log.workspace = true
 rand.workspace = true
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }

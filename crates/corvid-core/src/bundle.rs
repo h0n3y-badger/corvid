@@ -50,8 +50,12 @@ pub fn assemble(config: &Value, src: &Sources) -> String {
 /// Prefix a bundle body with its config (a JSON object literal). The block
 /// keeps `CORVID_CFG` (settings, callback token) out of the page's global
 /// lexical scope, where Discord's own scripts could read it.
+/// It goes in as `JSON.parse("…")`: plain data (a `"__proto__"` key in
+/// settings.json stays a key instead of setting a prototype), and V8 parses
+/// JSON faster than an object literal of the same size.
 pub fn with_config(config_json: &str, body: &str) -> String {
-    format!("{{ const CORVID_CFG = {config_json};\n{body}\n}}\n")
+    let lit = serde_json::to_string(config_json).expect("string serializes");
+    format!("{{ const CORVID_CFG = JSON.parse({lit});\n{body}\n}}\n")
 }
 
 /// core.js + plugins, without the config line.
@@ -81,7 +85,7 @@ mod tests {
         let s = Sources::load();
         assert!(s.core.contains("webpackChunkdiscord_app"));
         let out = assemble(&serde_json::json!({"token": "t"}), &s);
-        assert!(out.starts_with("{ const CORVID_CFG = {\"token\":\"t\"};"));
+        assert!(out.starts_with(r#"{ const CORVID_CFG = JSON.parse("{\"token\":\"t\"}");"#));
         assert!(out.trim_end().trim_end_matches('}').trim_end().ends_with("delete globalThis.__corvidDefine;"));
     }
 }
