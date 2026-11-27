@@ -354,6 +354,11 @@ function settingControl(plugin, key, def) {
     const labelEl = h("label", { for: id }, desc, restartTag);
 
     switch (def.type) {
+        case "custom": {
+            // The plugin builds the control (buttons, stats); no stored value.
+            const node = def.render?.(plugin);
+            return node instanceof Node ? node : null;
+        }
         case "boolean":
             return h("div", { class: "opt inline" }, labelEl,
                 switchInput(store[key], desc, v => commit(v), { id }));

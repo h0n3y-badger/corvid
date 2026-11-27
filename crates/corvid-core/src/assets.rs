@@ -30,7 +30,7 @@ const DIRECT_HOSTS: &[&str] = &["fonts.gstatic.com", "cdn.discordapp.com", "medi
 
 /// How fetches reach the network.
 #[derive(Debug, Clone)]
-enum Route {
+pub(crate) enum Route {
     /// No corvid proxy: ureq's default (honours the http(s)_proxy env vars).
     Default,
     /// corvid's proxy, which the page uses too.
@@ -76,7 +76,7 @@ pub fn base64(data: &[u8]) -> String {
 /// corvid's (Chromium-style) proxy setting as a ureq route. SOCKS goes out
 /// with remote DNS (socks5h/socks4a), as Chromium does for socks5, so theme
 /// host names don't leak to the local resolver either.
-fn route(proxy: &str) -> Route {
+pub(crate) fn route(proxy: &str) -> Route {
     let proxy = proxy.trim();
     if proxy.is_empty() {
         return Route::Default;

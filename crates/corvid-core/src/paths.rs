@@ -14,6 +14,8 @@ pub struct Paths {
     pub asset_cache: PathBuf,
     /// Media transcoded to WebM ($XDG_CACHE_HOME/corvid/media).
     pub media_cache: PathBuf,
+    /// Message logger store ($XDG_CACHE_HOME/corvid/message-log).
+    pub msglog_dir: PathBuf,
 }
 
 impl Paths {
@@ -25,6 +27,7 @@ impl Paths {
             profile_dir: data_dir.join("profile"),
             asset_cache: cache_dir.join("theme-assets"),
             media_cache: cache_dir.join("media"),
+            msglog_dir: cache_dir.join("message-log"),
             data_dir,
         }
     }

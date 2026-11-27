@@ -210,7 +210,7 @@ function assembleBundle(token) {
     }
     for (const n of opt.plugins) if (!names.includes(n)) die(`no plugin named ${n} (have: ${names.join(", ")})`);
     for (const n of names) plugins[n] = { enabled: !opt.plugins.length || opt.plugins.includes(n) };
-    const cfg = { settings: { plugins }, css: [], token, version: {} };
+    const cfg = { settings: { plugins }, css: [], token, version: {}, test: true };
     let out = `const CORVID_CFG = ${JSON.stringify(cfg)};\n${core}\n;(corvid => {\n`;
     // Mirrors crates/corvid-core/src/bundle.rs body().
     for (const [name, src] of sources) out += `try { (() => {\n${src}\n})(); } catch (e) { console.error("[corvid] plugin file ${name} failed", e); }\n`;

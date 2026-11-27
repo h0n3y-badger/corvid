@@ -36,6 +36,36 @@ unimplemented). Everything else is kept as small as possible.
   (static + animated) in any channel, guild stickers in other servers (static,
   GIF; APNG converted to GIF), stream quality unlock, client themes, app icons,
   soundboard; fake links render as real emojis/stickers for you.
+- **Message log** (MessageLogger plugin, on by default) — deleted messages
+  stay in the chat where they were, tinted red with a "deleted" marker (hover
+  it for the time; deletes that happened while corvid was closed say so), and
+  their media goes greyscale until you hover it or it plays. Edits keep the
+  previous versions above the current text. Survives restarts. Right-click a
+  logged message → *Remove message history*; right-click a channel, thread or
+  DM → *Clear message log*; corvid settings → MessageLogger shows cache stats
+  and *Clear the whole message log*. Ignore rules (bots, yourself, webhooks,
+  users/channels/servers) and limits are in its settings.
+  - Stored in `~/.cache/corvid/message-log/` (`ch/<channel>.jsonl`): deleted
+    messages and edit histories until you remove them, plus every message the
+    client saw for `rememberSeenDays` (default 7) so deletes of messages that
+    aren't loaded, and deletes/edits made while corvid was closed, can still
+    be logged. Text is capped at 512 MB (oldest seen messages go first).
+    `persist: false` keeps it in memory for the session only.
+  - Media policy: **images** (attachments, embed images, stickers) are never
+    downloaded, only their URL is kept, so a deleted image shows only as long
+    as Discord's CDN still serves it. **Audio** and voice messages are
+    downloaded when first seen (≤ `maxAudioMB`, 2 GB total, LRU with deleted
+    messages' files kept longest) into `message-log/audio/` and played from
+    there, also after a restart (m4a/aac through the transcoder). **Videos**
+    (attachments, embed videos, GIFs) are cached for the current session only
+    (`message-log/session-video/`, ≤ `maxVideoMB`, 2 GB total), so a video
+    deleted while corvid runs keeps playing; the folder is emptied at startup
+    and on exit, and after a restart a deleted video is just its URL again.
+    Downloads only go to `cdn.discordapp.com` / `media.discordapp.net` /
+    `images-ext-*.discordapp.net` over https, without redirects, through
+    `host.proxy` like theme assets.
+  - To clear it: the menu/settings actions above, or quit corvid and delete
+    `~/.cache/corvid/message-log/`.
 - **Themes + custom CSS** — drop BetterDiscord-style `.css` files in
   `~/.config/corvid/themes/`, toggle them in settings; quick CSS in
   `~/.config/corvid/quick.css`. Both hot-reload on save. Remote `@import`s and

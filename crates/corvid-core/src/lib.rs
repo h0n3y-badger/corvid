@@ -5,6 +5,8 @@ pub mod assets;
 pub mod bundle;
 pub mod host;
 pub mod media;
+pub mod msglog;
+pub mod msgmedia;
 pub mod paths;
 pub mod privacy;
 pub mod settings;

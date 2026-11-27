@@ -36,6 +36,8 @@ pub trait Ui: Send + Sync + 'static {
 pub struct Host {
     pub paths: Paths,
     pub options: HostOptions,
+    /// MessageLogger store (msglog.* commands, cached media lookups).
+    pub msglog: Arc<crate::msglog::MsgLog>,
     settings: Mutex<Value>,
     cache: AssetCache,
     /// Compiled CSS by sheet id, as last pushed.
@@ -64,8 +66,10 @@ impl Host {
         let s = settings::load(&paths.settings_file);
         let options = settings::host_options(&s);
         let cache = AssetCache::new(paths.asset_cache.clone(), options.remote_theme_assets, &options.proxy);
+        let msglog = Arc::new(crate::msglog::MsgLog::new(paths.msglog_dir.clone(), &options.proxy));
         Ok(Arc::new(Self {
             paths,
+            msglog,
             options,
             settings: Mutex::new(s),
             cache,
@@ -281,6 +285,14 @@ impl Host {
                     ui.open_external(url.as_str());
                 }
                 Ok(Value::Null)
+            }
+            c if c.starts_with("msglog.") => {
+                let r = self.msglog.invoke(&c["msglog.".len()..], args);
+                // The plugin has sent its settings (seen-record lifetime): expire and cap, off this thread.
+                if c == "msglog.init" {
+                    self.msglog.sweep_in_background();
+                }
+                r
             }
             "app.relaunch" => {
                 if let Some(ui) = self.ui() {

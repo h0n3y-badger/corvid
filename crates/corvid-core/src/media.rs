@@ -347,6 +347,22 @@ impl Transcoder {
     /// soon as it has data. Short clips and GIFs finish well inside `wait` and
     /// get a seekable file; long videos start playing instead of waiting.
     pub fn get(&self, url: &str, wait: Duration) -> Result<Source, String> {
+        if self.0.proxy_args.is_none() {
+            return Err("disabled".into());
+        }
+        self.get_input(url, Input::Url(url.to_owned()), wait)
+    }
+
+    /// Like `get`, but ffmpeg reads `file` (a file corvid downloaded itself,
+    /// e.g. the message log's cached audio/video) instead of the network.
+    /// `url` is only the cache key, so a later replay of the same attachment
+    /// finds the transcode. `ext` picks the pinned demuxer.
+    pub fn get_file(&self, url: &str, file: &Path, ext: &str, wait: Duration) -> Result<Source, String> {
+        demuxer(ext).ok_or("not a transcodable type")?;
+        self.get_input(url, Input::File(file.to_path_buf(), ext.to_owned()), wait)
+    }
+
+    fn get_input(&self, url: &str, input: Input, wait: Duration) -> Result<Source, String> {
         let key = self.0.key(url).ok_or("bad url")?;
         let out = self.0.dir.join(format!("{key}.webm"));
         if out.is_file() {
@@ -366,10 +382,11 @@ impl Transcoder {
                     });
                     jobs.insert(key.clone(), j.clone());
                     let (inner, job, url) = (self.0.clone(), j.clone(), url.to_string());
+                    let input = input.clone();
                     std::thread::Builder::new()
                         .name("corvid-ffmpeg".into())
                         .spawn(move || {
-                            let r = inner.run(&url, &job);
+                            let r = inner.run(&input, &job);
                             if let Err(e) = &r {
                                 log::warn!("transcode failed ({}): {e}", redact(&url));
                             }
@@ -418,15 +435,10 @@ impl Transcoder {
 }
 
 impl Inner {
-    fn run(&self, url: &str, job: &Job) -> Result<(), String> {
+    fn run(&self, input: &Input, job: &Job) -> Result<(), String> {
         let enc = self.encoder.get_or_init(pick_encoder).clone().ok_or("no encoder")?;
-        let proxy = self.proxy_args.as_ref().ok_or("disabled")?;
-        let u = url::Url::parse(url).map_err(|e| e.to_string())?;
-        let format = extension(&u).as_deref().and_then(demuxer).ok_or("not a transcodable type")?;
-        // Only the protocols an https fetch (optionally via an HTTP proxy)
-        // needs: no file:, data:, concat:, subfile:, rtmp: ... from inside a
-        // container. Plain http just for the local test origin.
-        let protocols = if is_test_url(url) && u.scheme() == "http" { "http,https,tls,tcp,httpproxy" } else { "https,tls,tcp,httpproxy" };
+        let input_args = input_args(input, self.proxy_args.as_deref())?;
+        let label = input.label();
         fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let part = job.out.with_extension("webm.part");
         // tee: '|' and ':' are its separators; the paths are ours (hex names
@@ -452,12 +464,7 @@ impl Inner {
             .env_remove("no_proxy")
             .env_remove("NO_PROXY")
             .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
-            .args(proxy)
-            .args(["-protocol_whitelist", protocols, "-format_whitelist", FORMAT_WHITELIST, "-codec_whitelist", CODEC_WHITELIST])
-            // The CDNs serve media directly (checked: Discord, Tenor, Giphy);
-            // a redirect could only lead somewhere HOSTS didn't allow.
-            .args(["-max_redirects", "0"])
-            .args(["-f", format, "-user_agent", USER_AGENT, "-rw_timeout", "30000000", "-i", url])
+            .args(&input_args)
             .args(["-map", "0:v:0?", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1"])
             // bound the work (and cache file) a crafted, very long input can cost
             .args(["-t", "7200"])
@@ -485,8 +492,62 @@ impl Inner {
         }
         fs::rename(&part, &job.out).map_err(|e| e.to_string())?;
         let size = fs::metadata(&job.out).map(|m| m.len()).unwrap_or(0);
-        log::info!("transcoded {} in {} ms ({} KB)", redact(url), t.elapsed().as_millis(), size / 1024);
+        log::info!("transcoded {} in {} ms ({} KB)", label, t.elapsed().as_millis(), size / 1024);
         Ok(())
+    }
+}
+
+/// Where ffmpeg reads from.
+#[derive(Debug, Clone)]
+enum Input {
+    /// The media URL itself (network).
+    Url(String),
+    /// A file corvid downloaded into its own cache, and its extension.
+    File(PathBuf, String),
+}
+
+impl Input {
+    fn label(&self) -> String {
+        match self {
+            Input::Url(u) => redact(u).to_owned(),
+            Input::File(p, _) => p.display().to_string(),
+        }
+    }
+}
+
+/// ffmpeg's input options. Each kind of input gets only its own protocols:
+/// network inputs never get `file`, and local files get nothing but `file`
+/// (so a crafted container can't reach the network from a cached file
+/// either; mov's external data references stay off with `-enable_drefs 0`).
+fn input_args(input: &Input, proxy: Option<&[String]>) -> Result<Vec<String>, String> {
+    let s = |a: &[&str]| a.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+    match input {
+        Input::Url(url) => {
+            let proxy = proxy.ok_or("disabled")?;
+            let u = url::Url::parse(url).map_err(|e| e.to_string())?;
+            let format = extension(&u).as_deref().and_then(demuxer).ok_or("not a transcodable type")?;
+            // Only the protocols an https fetch (optionally via an HTTP proxy)
+            // needs: no file:, data:, concat:, subfile:, rtmp: ... from inside a
+            // container. Plain http just for the local test origin.
+            let protocols = if is_test_url(url) && u.scheme() == "http" { "http,https,tls,tcp,httpproxy" } else { "https,tls,tcp,httpproxy" };
+            let mut a = proxy.to_vec();
+            a.extend(s(&["-protocol_whitelist", protocols, "-format_whitelist", FORMAT_WHITELIST, "-codec_whitelist", CODEC_WHITELIST]));
+            // The CDNs serve media directly (checked: Discord, Tenor, Giphy);
+            // a redirect could only lead somewhere HOSTS didn't allow.
+            a.extend(s(&["-max_redirects", "0", "-f", format, "-user_agent", USER_AGENT, "-rw_timeout", "30000000", "-i", url]));
+            Ok(a)
+        }
+        Input::File(path, ext) => {
+            let format = demuxer(ext).ok_or("not a transcodable type")?;
+            let p = path.to_str().filter(|p| p.starts_with('/')).ok_or("cached file path not usable")?;
+            let mut a = s(&["-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST, "-codec_whitelist", CODEC_WHITELIST]);
+            if format == "mov" {
+                a.extend(s(&["-enable_drefs", "0"]));
+            }
+            // "file:" prefix: a ':' further on can't be read as a protocol name.
+            a.extend(s(&["-f", format, "-i", &format!("file:{p}")]));
+            Ok(a)
+        }
     }
 }
 
@@ -606,6 +667,24 @@ mod tests {
             assert!(FORMAT_WHITELIST.split(',').any(|w| w == f), "{ext}");
         }
         assert_eq!(demuxer("m3u8"), None);
+    }
+
+    #[test]
+    fn local_input_gets_only_file_protocol() {
+        let a = input_args(&Input::File(PathBuf::from("/c/message-log/audio/1.m4a"), "m4a".into()), None).unwrap();
+        let wl = &a[a.iter().position(|x| x == "-protocol_whitelist").unwrap() + 1];
+        assert_eq!(wl, "file");
+        assert!(a.contains(&"-enable_drefs".to_owned()));
+        assert_eq!(a.last().unwrap(), "file:/c/message-log/audio/1.m4a");
+        assert!(!a.iter().any(|x| x.contains("https") || x == "-http_proxy"));
+        // network input never gets file:, and is off without usable proxy args
+        let u = "https://cdn.discordapp.com/attachments/1/2/a.m4a";
+        let n = input_args(&Input::Url(u.into()), Some(&[])).unwrap();
+        let wl = &n[n.iter().position(|x| x == "-protocol_whitelist").unwrap() + 1];
+        assert!(!wl.split(',').any(|p| p == "file"), "{wl}");
+        assert!(input_args(&Input::Url(u.into()), None).is_err());
+        assert!(input_args(&Input::File(PathBuf::from("rel/1.m4a"), "m4a".into()), None).is_err());
+        assert!(input_args(&Input::File(PathBuf::from("/x/1.ogg"), "ogg".into()), None).is_err());
     }
 
     #[test]

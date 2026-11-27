@@ -450,10 +450,27 @@ wrap_request_handler! {
             _disable_default_handling: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
             let request = request?;
-            if self.shared.media.is_some() && request.resource_type() == ResourceType::MEDIA {
+            let rtype = request.resource_type();
+            // The message log's cached audio (and, this session, deleted
+            // messages' videos): served from disk instead of the network,
+            // which may no longer have them. Media elements and fetches only.
+            if matches!(rtype, ResourceType::MEDIA | ResourceType::XHR) && us(&request.method()) == "GET" {
+                let url = us(&request.url());
+                if let Some(c) = self.shared.host.msglog.media.lookup(&url) {
+                    log::info!("message log: serving cached {} ({})", url.split('?').next().unwrap_or(""), c.ext);
+                    let (mime, audio) = (c.mime(), c.kind == corvid_core::msgmedia::Kind::Audio);
+                    let src = match (c.needs_transcode(), self.shared.media.is_some()) {
+                        (true, true) => MediaSrc::TranscodeFile(c.path, c.ext),
+                        _ => MediaSrc::Plain(c.path, mime),
+                    };
+                    let kind = if audio { media::Kind::Audio } else { media::Kind::Video };
+                    return Some(MediaRequest::new(self.shared.clone(), kind, src));
+                }
+            }
+            if self.shared.media.as_ref().is_some_and(|t| t.enabled()) && rtype == ResourceType::MEDIA {
                 let url = us(&request.url());
                 if let Some(kind) = media::wants(&url) {
-                    return Some(MediaRequest::new(self.shared.clone(), kind));
+                    return Some(MediaRequest::new(self.shared.clone(), kind, MediaSrc::Transcode));
                 }
             }
             if !self.shared.host.options.block_telemetry {
@@ -547,6 +564,17 @@ wrap_resource_handler! {
     }
 }
 
+/// What a media request is answered with.
+#[derive(Clone)]
+enum MediaSrc {
+    /// Transcode the request URL (network) to WebM.
+    Transcode,
+    /// Transcode a file from the message log's cache; the URL is the cache key.
+    TranscodeFile(std::path::PathBuf, String),
+    /// Serve a message-log cache file unchanged, with this content type.
+    Plain(std::path::PathBuf, &'static str),
+}
+
 // Media the minimal CEF build can't decode (H.264/HEVC/AAC): served as WebM
 // transcoded by corvid_core::media. Range requests are left to CEF, which
 // calls skip() and turns our 200 into a 206 with Content-Range.
@@ -554,6 +582,7 @@ wrap_resource_request_handler! {
     struct MediaRequest {
         shared: Arc<Shared>,
         kind: media::Kind,
+        src: MediaSrc,
     }
 
     impl ResourceRequestHandler {
@@ -573,7 +602,7 @@ wrap_resource_request_handler! {
             _frame: Option<&mut Frame>,
             _request: Option<&mut Request>,
         ) -> Option<ResourceHandler> {
-            Some(MediaHandler::new(self.shared.clone(), self.kind, Arc::new(Mutex::new(Served::default()))))
+            Some(MediaHandler::new(self.shared.clone(), self.kind, self.src.clone(), Arc::new(Mutex::new(Served::default()))))
         }
     }
 }
@@ -657,6 +686,7 @@ wrap_resource_handler! {
     struct MediaHandler {
         shared: Arc<Shared>,
         kind: media::Kind,
+        src: MediaSrc,
         state: Arc<Mutex<Served>>,
     }
 
@@ -667,8 +697,7 @@ wrap_resource_handler! {
             handle_request: Option<&mut i32>,
             callback: Option<&mut Callback>,
         ) -> i32 {
-            let (Some(req), Some(handle), Some(cb), Some(t)) = (request, handle_request, callback, self.shared.media.as_ref())
-            else {
+            let (Some(req), Some(handle), Some(cb)) = (request, handle_request, callback) else {
                 return 0;
             };
             let url = us(&req.url());
@@ -677,6 +706,13 @@ wrap_resource_handler! {
                 st.origin = us(&req.header_by_name(Some(&cs("Origin"))));
                 st.range_header = us(&req.header_by_name(Some(&cs("Range"))));
             }
+            // A file of the message log's cache, served as is.
+            if let MediaSrc::Plain(p, _) = &self.src {
+                self.state.lock().unwrap().load(&media::Source::File(p.clone()));
+                *handle = 1;
+                return 1;
+            }
+            let Some(t) = self.shared.media.as_ref() else { return 0 };
             if let Some(p) = t.cached(&url) {
                 self.state.lock().unwrap().load(&media::Source::File(p));
                 *handle = 1;
@@ -685,10 +721,14 @@ wrap_resource_handler! {
             // Transcode off the IO thread; CEF waits for cont().
             *handle = 0;
             let cb = SendCallback(cb.clone());
-            let (shared, state) = (self.shared.clone(), self.state.clone());
+            let (shared, state, src) = (self.shared.clone(), self.state.clone(), self.src.clone());
             let spawned = std::thread::Builder::new().name("corvid-media".into()).spawn(move || {
                 let cb = cb;
-                let r = shared.media.as_ref().map(|t| t.get(&url, MEDIA_WAIT)).unwrap_or(Err("off".into()));
+                let r = match (&src, shared.media.as_ref()) {
+                    (MediaSrc::TranscodeFile(p, ext), Some(t)) => t.get_file(&url, p, ext, MEDIA_WAIT),
+                    (_, Some(t)) => t.get(&url, MEDIA_WAIT),
+                    (_, None) => Err("off".into()),
+                };
                 {
                     let mut st = state.lock().unwrap();
                     match r {
@@ -721,7 +761,16 @@ wrap_resource_handler! {
             }
             let origin = if st.origin.is_empty() { "*" } else { &st.origin };
             r.set_header_by_name(Some(&cs("Access-Control-Allow-Origin")), Some(&cs(origin)), 1);
-            r.set_mime_type(Some(&cs(self.kind.mime())));
+            let mime = match &self.src {
+                MediaSrc::Plain(_, m) => m,
+                _ => self.kind.mime(),
+            };
+            r.set_mime_type(Some(&cs(mime)));
+            r.set_header_by_name(Some(&cs("X-Content-Type-Options")), Some(&cs("nosniff")), 1);
+            if !matches!(self.src, MediaSrc::Transcode) {
+                // Lets tests (and curious users in DevTools) see where it came from.
+                r.set_header_by_name(Some(&cs("X-Corvid-Source")), Some(&cs("message-log")), 1);
+            }
             if st.live.is_some() {
                 // Growing file: unknown length, not seekable on this first play.
                 r.set_status(200);
@@ -1489,8 +1538,7 @@ pub fn run(opts: Options, paths: Paths, listener: Option<UnixListener>) -> Resul
         media: host
             .options
             .transcode_media
-            .then(|| media::Transcoder::new(paths.media_cache.clone(), &effective_proxy(&host.options.proxy)))
-            .filter(|t| t.enabled()),
+            .then(|| media::Transcoder::new(paths.media_cache.clone(), &effective_proxy(&host.options.proxy))),
     });
     host.set_ui(Arc::new(CefUi { shared: Arc::downgrade(&shared) }));
     let watcher = host.watch().map_err(|e| log::warn!("theme watcher: {e}")).ok();
@@ -1543,6 +1591,8 @@ pub fn run(opts: Options, paths: Paths, listener: Option<UnixListener>) -> Resul
     log::info!("[{} ms] CEF initialized", ms());
     run_message_loop();
     shutdown();
+    // Clean exit: the session-only video cache goes.
+    host.msglog.shutdown();
     Ok(RELAUNCH.load(Ordering::SeqCst))
 }
 
